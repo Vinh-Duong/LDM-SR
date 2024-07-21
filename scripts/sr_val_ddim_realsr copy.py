@@ -22,6 +22,7 @@ from ldm.models.diffusion.plms import PLMSSampler
 from basicsr.metrics import calculate_niqe
 import math
 import copy
+import torch.nn.functional as F
 
 def calc_mean_std(feat, eps=1e-5):
     """Calculate mean and std for adaptive_instance_normalization.
@@ -76,15 +77,31 @@ def load_model_from_config(config, ckpt, verbose=False):
     model.eval()
     return model
 
+def im_crop_center(img, w, h):
+    img_width, img_height = img.size
+    left, right = (img_width - w) / 2, (img_width + w) / 2
+    top, bottom = (img_height - h) / 2, (img_height + h) / 2
+    left, top = round(max(0, left)), round(max(0, top))
+    right, bottom = round(min(img_width - 0, right)), round(min(img_height - 0, bottom))
+    return img.crop((left, top, right, bottom))
 
-def load_img(path):
+
+def load_img(path, center_crop = True):
     image = Image.open(path).convert("RGB")
     w, h = image.size
     print(f"loaded input image of size ({w}, {h}) from {path}")
     w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
     image = image.resize((w, h), resample=PIL.Image.LANCZOS)
+
+    if center_crop:
+        new_size = h if h < w else w
+        image = im_crop_center(image,new_size, new_size )
+    w, h = image.size
+    print(f"after crop image the image size is ({w}, {h})")
+
     image = np.array(image).astype(np.float32) / 255.0
     image = image[None].transpose(0, 3, 1, 2)
+    
     image = torch.from_numpy(image)
     return 2.*image - 1.
 
@@ -295,19 +312,66 @@ def main():
                 for n in trange(niters, desc="Sampling"):
                     # seed_everything(opt.seed*n)
                     cur_img_list = img_list_chunk[n]
-                    init_image_list = []
+                    sr_image_list = []
+                    lr_image_list_lv_1 = []
+                    lr_image_list_lv_2 = []
                     for item in cur_img_list:
-                        cur_image = load_img(os.path.join(opt.init_img, item)).to(device)
-                        cur_image = transform(cur_image)
-                        init_image_list.append(cur_image)
-                    init_image = torch.cat(init_image_list, dim=0)
+                        lr_image_lv_1 = load_img(os.path.join(opt.init_img, item), center_crop=False).to(device)
+
+                        # cur_image = transform(cur_image)
+                        # b, c, w, h = cur_image.shape
+                        # print(f"after transform the image size is ({w}, {h})")
+
+                        lr_image_lv_2 = F.interpolate(
+									lr_image_lv_1,
+									size=(int(lr_image_lv_1.size(-2)*(1/opt.scale)),
+										  int(lr_image_lv_1.size(-1)*(1/opt.scale))),
+									mode='bicubic',
+									)
+                        
+                        sr_image = F.interpolate(
+									lr_image_lv_1,
+									size=(int(lr_image_lv_1.size(-2)*opt.scale),
+										  int(lr_image_lv_1.size(-1)*opt.scale)),
+									mode='bicubic',
+									)
+                        
+                        b, c, w, h = sr_image.shape
+                        print(f"sr_image size is ({w}, {h})")
+
+
+
+                        lr_image_list_lv_1.append(lr_image_lv_1)
+                        lr_image_list_lv_2.append(lr_image_lv_2)
+
+                        sr_image_list.append(sr_image)
+
+                    lr_image_lv_1 = torch.cat(lr_image_list_lv_1, dim=0)
+                    lr_image_lv_2 = torch.cat(lr_image_list_lv_2, dim=0)
+
+                    sr_image = torch.cat(sr_image_list, dim=0)
+
+                    init_latent_lv_1 = model.get_first_stage_encoding(model.encode_first_stage(sr_image))
+                    b, c, w, h = init_latent_lv_1.shape
+                    print(f"init_latent_lv_1 size is ({w}, {h})")
+
+                    init_latent_lv_2 = model.get_first_stage_encoding(model.encode_first_stage(init_latent_lv_1))
+                    b, c, w, h = init_latent_lv_2.shape
+                    print(f"init_latent_lv_2 size is ({w}, {h})")
 
                     # decode it
-                    samples, _ = sampler.sample(t_enc, init_image.size(0), (3,opt.input_size // 4,opt.input_size // 4), init_image, eta=opt.ddim_eta, verbose=False, x_T=x_T)
+                    samples, _ = sampler.sample(t_enc, init_latent_lv_2.size(0), (3, init_latent_lv_2.size(2),init_latent_lv_2.size(3)), lr_image_lv_2, eta=opt.ddim_eta, verbose=False, x_T=x_T)
+                    
+                    samples += init_latent_lv_2
 
-                    x_samples = model.decode_first_stage(samples)
+                    x_samples_lv_2 = model.decode_first_stage(samples)
+                    x_samples_lv_2 +=init_latent_lv_1
+
+                    x_samples = model.decode_first_stage(x_samples_lv_2)
+                    x_samples += sr_image 
+                    
                     if opt.color_fix:
-                        x_samples = adaptive_instance_normalization(x_samples, init_image)
+                        x_samples = adaptive_instance_normalization(x_samples, lr_image_lv_1)
                     x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
 
                     if not opt.skip_save:
@@ -317,12 +381,12 @@ def main():
                             Image.fromarray(x_sample.astype(np.uint8)).save(
                                 os.path.join(sample_path, cur_img_list[i]))
                         if opt.save_input:
-                            for i in range(init_image.size(0)):
-                                x_input = 255. * rearrange(init_image[i].cpu().numpy(), 'c h w -> h w c')
+                            for i in range(lr_image_lv_1.size(0)):
+                                x_input = 255. * rearrange(lr_image_lv_1[i].cpu().numpy(), 'c h w -> h w c')
                                 x_input = (x_input+255.)/2
                                 Image.fromarray(x_input.astype(np.uint8)).save(
                                     os.path.join(input_path, cur_img_list[i]))
-                        base_i += init_image.size(0)
+                        base_i += lr_image_lv_1.size(0)
                     all_samples.append(x_samples)
 
                 if not opt.skip_grid:
